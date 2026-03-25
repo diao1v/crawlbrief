@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+coverage/
+.vitest/
+
+# PostgreSQL data
+docker/postgres/data/
+
+# IDE
+.idea/
+.vscode/
+.claude/
