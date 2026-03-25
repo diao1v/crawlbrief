@@ -11,7 +11,7 @@ import type { AppEnv } from '../types/hono.js';
 
 /**
  * Verify webhook signature using HMAC-SHA256.
- * Firecrawl sends signature in X-Webhook-Signature header.
+ * Gateway sends signature in X-Webhook-Signature header with format: sha256=<hex>
  */
 function verifyWebhookSignature(
   payload: string,
@@ -19,6 +19,11 @@ function verifyWebhookSignature(
   secret: string
 ): boolean {
   if (!signature) return false;
+
+  // Strip 'sha256=' prefix if present
+  const actualSignature = signature.startsWith('sha256=')
+    ? signature.slice(7)
+    : signature;
 
   const expectedSignature = crypto
     .createHmac('sha256', secret)
@@ -28,7 +33,7 @@ function verifyWebhookSignature(
   // Use timing-safe comparison to prevent timing attacks
   try {
     return crypto.timingSafeEqual(
-      Buffer.from(signature),
+      Buffer.from(actualSignature),
       Buffer.from(expectedSignature)
     );
   } catch {
