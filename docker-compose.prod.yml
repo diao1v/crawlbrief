@@ -1,13 +1,29 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: crawlbrief-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crawlbrief}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-crawlbrief}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-crawlbrief}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   crawlbrief:
     build:
       context: .
       dockerfile: docker/Dockerfile
     container_name: crawlbrief
     restart: unless-stopped
-    # Use host network to connect to PostgreSQL on host's localhost:5432
+    depends_on:
+      postgres:
+        condition: service_healthy
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     ports:
@@ -16,7 +32,7 @@ services:
       - NODE_ENV=production
       - CRAWLBRIEF_PORT=3001
       - CRAWLBRIEF_BASE_URL=${CRAWLBRIEF_BASE_URL}
-      - CRAWLBRIEF_DATABASE_URL=${CRAWLBRIEF_DATABASE_URL}
+      - CRAWLBRIEF_DATABASE_URL=postgresql://${POSTGRES_USER:-crawlbrief}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-crawlbrief}
       - CRAWLBRIEF_GATEWAY_URL=${CRAWLBRIEF_GATEWAY_URL}
       - CRAWLBRIEF_GATEWAY_TOKEN=${CRAWLBRIEF_GATEWAY_TOKEN}
       - CRAWLBRIEF_LLM_PROVIDER=${CRAWLBRIEF_LLM_PROVIDER:-openai}
@@ -39,3 +55,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  postgres_data:
