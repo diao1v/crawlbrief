@@ -17,7 +17,7 @@ export const monitors: MonitorConfig[] = [
     id: 'ziflow',
     name: 'Ziflow Product Updates',
     listingUrl: 'https://www.ziflow.com/blog?category=117286927702',
-    schedule: '0 9 * * *', // Daily at 9:00 AM (in configured timezone)
+    schedule: '0 9 * * *',
     enabled: true,
     extractionPrompt: `You are analyzing a Ziflow blog page filtered to the "Product Updates" category.
 
@@ -48,6 +48,41 @@ Respond with a JSON object in this exact format:
 }
 
 If no product update articles are found, return: { "articles": [] }`,
+  },
+  {
+    id: 'filestage',
+    name: 'Filestage Changelog',
+    listingUrl: 'https://changelog.filestage.io/',
+    schedule: '0 9 * * *',
+    enabled: true,
+  },
+  {
+    id: 'aproove',
+    name: 'Aproove New Releases',
+    listingUrl: 'https://www.aproove.com/blog/tag/new-release',
+    schedule: '0 9 * * *',
+    enabled: true,
+  },
+  {
+    id: 'artworkflowhq',
+    name: 'ArtworkFlow Updates',
+    listingUrl: '',
+    schedule: '0 9 * * *',
+    enabled: false, // No listing URL available yet
+  },
+  {
+    id: 'reviewstudio',
+    name: 'ReviewStudio Product News',
+    listingUrl: 'https://reviewstudio.com/blog/category/reviewstudio-product-news-updates/',
+    schedule: '0 9 * * *',
+    enabled: true,
+  },
+  {
+    id: 'govisually',
+    name: 'GoVisually Updates',
+    listingUrl: 'https://updates.govisually.com/',
+    schedule: '0 9 * * *',
+    enabled: true,
   },
 ];
 
