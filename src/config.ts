@@ -13,11 +13,16 @@ const envSchema = z.object({
   CRAWLBRIEF_GATEWAY_TOKEN: z.string().min(1),
 
   // LLM Provider
-  CRAWLBRIEF_LLM_PROVIDER: z.enum(['openai', 'anthropic']).default('openai'),
+  CRAWLBRIEF_LLM_PROVIDER: z.enum(['openai', 'anthropic', 'azure']).default('openai'),
   CRAWLBRIEF_OPENAI_API_KEY: z.string().optional(),
   CRAWLBRIEF_OPENAI_MODEL: z.string().default('gpt-4o-mini'),
   CRAWLBRIEF_ANTHROPIC_API_KEY: z.string().optional(),
   CRAWLBRIEF_ANTHROPIC_MODEL: z.string().default('claude-3-haiku-20240307'),
+
+  // Azure AI Foundry (OpenAI-compatible endpoint)
+  CRAWLBRIEF_AZURE_MODEL_URL: z.string().url().optional(),
+  CRAWLBRIEF_AZURE_MODEL_KEY: z.string().optional(),
+  CRAWLBRIEF_AZURE_MODEL: z.string().optional(),
 
   // Cloudflare AI Gateway (optional - proxies requests through Cloudflare for caching, analytics, rate limiting)
   // Format: https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_name}
@@ -26,7 +31,7 @@ const envSchema = z.object({
   CRAWLBRIEF_CF_AI_GATEWAY_TOKEN: z.string().optional(),
   // Use BYOK (Bring Your Own Keys) - API keys stored in Cloudflare, not in .env
   // When true, you don't need OPENAI_API_KEY or ANTHROPIC_API_KEY in .env
-  CRAWLBRIEF_CF_AI_GATEWAY_USE_BYOK: z.coerce.boolean().default(true),
+  CRAWLBRIEF_CF_AI_GATEWAY_USE_BYOK: z.string().default('true').transform((val) => val === 'true'),
 
   // Slack
   CRAWLBRIEF_SLACK_BOT_TOKEN: z.string().startsWith('xoxb-'),
@@ -72,6 +77,14 @@ function validateLLMConfig(config: z.infer<typeof envSchema>) {
     console.error('Invalid environment configuration:');
     console.error('  - CRAWLBRIEF_ANTHROPIC_API_KEY is required when CRAWLBRIEF_LLM_PROVIDER is anthropic');
     process.exit(1);
+  }
+
+  if (config.CRAWLBRIEF_LLM_PROVIDER === 'azure') {
+    if (!config.CRAWLBRIEF_AZURE_MODEL_URL || !config.CRAWLBRIEF_AZURE_MODEL_KEY || !config.CRAWLBRIEF_AZURE_MODEL) {
+      console.error('Invalid environment configuration:');
+      console.error('  - CRAWLBRIEF_AZURE_MODEL_URL, CRAWLBRIEF_AZURE_MODEL_KEY, and CRAWLBRIEF_AZURE_MODEL are required when CRAWLBRIEF_LLM_PROVIDER is azure');
+      process.exit(1);
+    }
   }
 }
 

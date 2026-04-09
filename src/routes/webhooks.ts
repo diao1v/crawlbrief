@@ -228,7 +228,16 @@ async function handlePageEvent(
       .where(eq(schema.crawlRuns.id, scrapeJob.crawlRunId));
   } else if (scrapeJob.jobType === 'articles') {
     // Handle individual article result
-    childLogger.info({ url: payload.data.url }, 'Processing article');
+    // Firecrawl puts the URL in metadata.sourceURL, not at the top level
+    const articleUrl = payload.data.url
+      || (payload.data.metadata?.sourceURL as string | undefined)
+      || (payload.data.metadata?.url as string | undefined);
+    childLogger.info({ url: articleUrl }, 'Processing article');
+
+    if (!articleUrl) {
+      childLogger.warn('No URL found in article data, skipping');
+      return;
+    }
 
     try {
       const extractedTitle = payload.data.metadata?.title as string | undefined;
@@ -238,7 +247,7 @@ async function handlePageEvent(
         .insert(schema.articles)
         .values({
           monitorId: monitor.id,
-          url: payload.data.url,
+          url: articleUrl,
           title: extractedTitle || null,
           crawlRunId: scrapeJob.crawlRunId,
         })

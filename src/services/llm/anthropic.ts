@@ -54,11 +54,38 @@ export class AnthropicProvider implements LLMProvider {
 
   private extractJsonFromResponse(content: string): string {
     // Anthropic may wrap JSON in markdown code blocks
+    // Try with closing backticks first
     const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (jsonMatch && jsonMatch[1]) {
       return jsonMatch[1].trim();
     }
+    // Try without closing backticks (Anthropic sometimes omits them)
+    const openMatch = content.match(/```(?:json)?\s*([\s\S]*)/);
+    if (openMatch && openMatch[1]) {
+      return openMatch[1].trim();
+    }
+    // Try to find raw JSON object/array
+    const rawJson = content.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (rawJson && rawJson[1]) {
+      return rawJson[1].trim();
+    }
     return content.trim();
+  }
+
+  /**
+   * Trim markdown to reduce noise for LLM processing.
+   * Removes common boilerplate and limits total size.
+   */
+  private trimMarkdown(markdown: string, maxChars = 30000): string {
+    // Remove lines that are just country names (from form dropdowns)
+    let trimmed = markdown.replace(/^.*(?:Afghanistan|Bahrain|Bangladesh|Cameroon|Denmark|Ecuador).*$/gm, '');
+    // Collapse multiple blank lines
+    trimmed = trimmed.replace(/\n{3,}/g, '\n\n');
+    // Truncate if still too long
+    if (trimmed.length > maxChars) {
+      trimmed = trimmed.substring(0, maxChars);
+    }
+    return trimmed.trim();
   }
 
   async extractArticles(
@@ -66,21 +93,26 @@ export class AnthropicProvider implements LLMProvider {
     baseUrl: string,
     customPrompt?: string
   ): Promise<ExtractedArticles> {
+    const trimmedMarkdown = this.trimMarkdown(markdown);
     const systemPrompt = formatExtractionPrompt(baseUrl, customPrompt);
 
-    logger.debug({ model: this.model, baseUrl }, 'Extracting articles with Anthropic');
+    logger.debug({ model: this.model, baseUrl, originalLength: markdown.length, trimmedLength: trimmedMarkdown.length }, 'Extracting articles with Anthropic');
 
     try {
       const response = await this.client.messages.create({
         model: this.model,
-        max_tokens: 4096,
+        max_tokens: 8192,
         system: systemPrompt,
-        messages: [{ role: 'user', content: markdown }],
+        messages: [{ role: 'user', content: trimmedMarkdown }],
       });
 
       const textBlock = response.content.find((block) => block.type === 'text');
       if (!textBlock || textBlock.type !== 'text') {
         throw new LLMError('Anthropic returned no text content');
+      }
+
+      if (response.stop_reason === 'max_tokens') {
+        logger.warn('Anthropic response truncated due to max_tokens limit');
       }
 
       const jsonContent = this.extractJsonFromResponse(textBlock.text);

@@ -58,6 +58,7 @@ export class MonitorRunner {
       : undefined;
 
     // Submit batch scrape for listing page
+    // waitFor gives JS category filters time to apply
     const jobId = await gatewayClient.startBatchScrape(
       [monitor.listingUrl],
       {
@@ -66,6 +67,7 @@ export class MonitorRunner {
         changeTrackingTag: `listing:${monitorId}`,
         webhookUrl,
         webhookEvents: ['page', 'completed'],
+        waitFor: 3000,
       },
       this.requestId
     );

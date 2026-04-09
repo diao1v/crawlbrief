@@ -19,6 +19,35 @@ export const monitors: MonitorConfig[] = [
     listingUrl: 'https://www.ziflow.com/blog?category=117286927702',
     schedule: '0 9 * * *', // Daily at 9:00 AM (in configured timezone)
     enabled: true,
+    extractionPrompt: `You are analyzing a Ziflow blog page filtered to the "Product Updates" category.
+
+Your task is to extract ONLY article links that belong to the "Product Updates" category.
+
+Instructions:
+1. Only include articles that are product updates, feature announcements, or release notes
+2. Do NOT include articles from other categories like "Creative workflow", "Company news", "Marketing compliance", or "Review and approval"
+3. Extract the full URL for each article
+4. Extract the title if visible
+5. Extract the published date if visible
+6. Extract a brief excerpt if available
+7. Only include links to actual blog post articles, not navigation links or category links
+8. If a URL is relative, construct the full URL using the base URL provided
+
+Base URL: {{BASE_URL}}
+
+Respond with a JSON object in this exact format:
+{
+  "articles": [
+    {
+      "url": "https://example.com/article-1",
+      "title": "Article Title",
+      "publishedDate": "2024-01-15",
+      "excerpt": "Brief description..."
+    }
+  ]
+}
+
+If no product update articles are found, return: { "articles": [] }`,
   },
 ];
 

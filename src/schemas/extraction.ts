@@ -3,8 +3,8 @@ import { z } from 'zod';
 export const extractedArticleSchema = z.object({
   url: z.string().url(),
   title: z.string(),
-  publishedDate: z.string().optional(),
-  excerpt: z.string().optional(),
+  publishedDate: z.string().nullable().optional(),
+  excerpt: z.string().nullable().optional(),
 });
 
 export const extractedArticlesSchema = z.object({
