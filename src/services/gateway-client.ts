@@ -26,6 +26,7 @@ interface BatchScrapeOptions {
   formats?: string[];
   includeTags?: string[];
   excludeTags?: string[];
+  waitFor?: number;
   changeTracking?: boolean;
   changeTrackingTag?: string;
   webhookUrl?: string;
