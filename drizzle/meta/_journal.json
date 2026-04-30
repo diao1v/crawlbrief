@@ -15,6 +15,13 @@
       "when": 1774319353397,
       "tag": "0001_heavy_nebula",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1777589189843,
+      "tag": "0002_cool_lester",
+      "breakpoints": true
     }
   ]
 }

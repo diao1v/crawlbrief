@@ -5,9 +5,13 @@ import { db, schema } from '../db/index.js';
 import { logger } from '../lib/logger.js';
 import { getLLMProvider } from '../services/llm/index.js';
 import { gatewayClient } from '../services/gateway-client.js';
+import { getSlackService } from '../services/slack.js';
+import { classifyPage, normalizeTitle } from '../services/scrape-utils.js';
+import { recordRunFailure } from '../services/run-failures.js';
 import { getMonitorById } from '../monitors.config.js';
 import { config } from '../config.js';
 import type { AppEnv } from '../types/hono.js';
+import type { PageFailure } from '../db/schema.js';
 
 /**
  * Verify webhook signature using HMAC-SHA256.
@@ -145,6 +149,45 @@ async function handlePageEvent(
       'Processing listing page result'
     );
 
+    const listingUrl =
+      (payload.data.metadata?.sourceURL as string | undefined) || monitor.listingUrl;
+
+    // Status-code guard: if the listing page itself failed, mark the run failed and stop
+    const listingFailure = classifyPage(
+      listingUrl,
+      payload.data.markdown,
+      payload.data.metadata as { statusCode?: number } | undefined
+    );
+    if (listingFailure) {
+      childLogger.warn(
+        { ...listingFailure, monitorId: monitor.id },
+        'Listing page failed - marking run as failed'
+      );
+      await recordRunFailure(scrapeJob.crawlRunId, listingFailure);
+      await db
+        .update(schema.crawlRuns)
+        .set({
+          status: 'failed',
+          completedAt: new Date(),
+          error: `Listing scrape failed: ${listingFailure.reason}${listingFailure.statusCode ? ` (status ${listingFailure.statusCode})` : ''}`,
+        })
+        .where(eq(schema.crawlRuns.id, scrapeJob.crawlRunId));
+      try {
+        await getSlackService().sendRunFailureNotification({
+          monitorName: monitor.name,
+          runId: scrapeJob.crawlRunId,
+          listingUrl: monitor.listingUrl,
+          failedCount: 1,
+          newArticles: 0,
+          failures: [listingFailure],
+          kind: 'listing',
+        });
+      } catch (err) {
+        childLogger.error({ err }, 'Failed to send listing-failure Slack notification');
+      }
+      return;
+    }
+
     // Store listing content
     await db.insert(schema.listingContent).values({
       crawlRunId: scrapeJob.crawlRunId,
@@ -159,11 +202,12 @@ async function handlePageEvent(
       return;
     }
 
-    // Extract article URLs using LLM
+    // Extract article URLs using LLM. Use post-redirect URL so relative links resolve correctly
+    // when a site has migrated (prevents hallucinating URLs against the old domain).
     const llm = getLLMProvider();
     const extractedArticles = await llm.extractArticles(
       payload.data.markdown || '',
-      monitor.listingUrl,
+      listingUrl,
       monitor.extractionPrompt
     );
 
@@ -173,15 +217,32 @@ async function handlePageEvent(
       return;
     }
 
-    // Filter out already-seen URLs
+    // Filter out already-seen URLs (and titles, to catch domain migrations where URLs changed
+    // but the article identity is the same).
     const existingArticles = await db.query.articles.findMany({
       where: eq(schema.articles.monitorId, monitor.id),
-      columns: { url: true },
+      columns: { url: true, titleNormalized: true },
     });
     const existingUrls = new Set(existingArticles.map((a) => a.url));
+    const existingTitles = new Set(
+      existingArticles
+        .map((a) => a.titleNormalized)
+        .filter((t): t is string => typeof t === 'string' && t.length > 0)
+    );
     const newUrls = extractedArticles.articles
-      .map((a) => a.url)
-      .filter((url) => !existingUrls.has(url));
+      .filter((a) => {
+        if (existingUrls.has(a.url)) return false;
+        const tn = normalizeTitle(a.title);
+        if (tn && existingTitles.has(tn)) {
+          childLogger.info(
+            { url: a.url, title: a.title },
+            'Skipping article: title already seen on different URL (likely domain migration)'
+          );
+          return false;
+        }
+        return true;
+      })
+      .map((a) => a.url);
 
     if (newUrls.length === 0) {
       childLogger.info(
@@ -234,8 +295,21 @@ async function handlePageEvent(
       || (payload.data.metadata?.url as string | undefined);
     childLogger.info({ url: articleUrl }, 'Processing article');
 
-    if (!articleUrl) {
-      childLogger.warn('No URL found in article data, skipping');
+    // Status-code guard: skip 4xx/5xx pages and empty content before LLM/DB work.
+    // Do NOT insert into articles table - we want the URL to be retried on a future run
+    // when it might work (e.g. transient outage, listing URL gets fixed).
+    const failure = classifyPage(
+      articleUrl,
+      payload.data.markdown,
+      payload.data.metadata as { statusCode?: number } | undefined
+    );
+    if (failure) {
+      childLogger.warn({ ...failure }, 'Skipping article (failed classification)');
+      await recordRunFailure(scrapeJob.crawlRunId, failure);
+      await db
+        .update(schema.scrapeJobs)
+        .set({ completedCount: sql`${schema.scrapeJobs.completedCount} + 1` })
+        .where(eq(schema.scrapeJobs.id, scrapeJob.id));
       return;
     }
 
@@ -247,8 +321,9 @@ async function handlePageEvent(
         .insert(schema.articles)
         .values({
           monitorId: monitor.id,
-          url: articleUrl,
+          url: articleUrl!,
           title: extractedTitle || null,
+          titleNormalized: normalizeTitle(extractedTitle),
           crawlRunId: scrapeJob.crawlRunId,
         })
         .onConflictDoNothing()
@@ -266,7 +341,7 @@ async function handlePageEvent(
         const llm = getLLMProvider();
         const summary = await llm.summarizeArticle(
           payload.data.markdown || '',
-          payload.data.url,
+          articleUrl!,
           monitor.summaryPrompt
         );
 
@@ -300,10 +375,10 @@ async function handlePageEvent(
           'Article processed'
         );
       } else {
-        childLogger.debug({ url: payload.data.url }, 'Article already exists, skipping');
+        childLogger.debug({ url: articleUrl }, 'Article already exists, skipping');
       }
     } catch (error) {
-      childLogger.error({ url: payload.data.url, error }, 'Failed to process article');
+      childLogger.error({ url: articleUrl, error }, 'Failed to process article');
     }
 
     // Update completed count atomically
@@ -364,6 +439,30 @@ async function completeRun(
     .where(eq(schema.crawlRuns.id, crawlRunId));
 
   logger.info({ crawlRunId, articlesFound, newArticles }, 'Crawl run completed');
+
+  // If any article failed, send a single aggregate Slack message
+  const run = await db.query.crawlRuns.findFirst({
+    where: eq(schema.crawlRuns.id, crawlRunId),
+  });
+  if (!run || run.failedCount === 0) return;
+
+  const monitor = getMonitorById(run.monitorId);
+  if (!monitor) return;
+
+  const failures = (run.failureSummary || []) as PageFailure[];
+  try {
+    await getSlackService().sendRunFailureNotification({
+      monitorName: monitor.name,
+      runId: crawlRunId,
+      listingUrl: monitor.listingUrl,
+      failedCount: run.failedCount,
+      newArticles,
+      failures,
+      kind: 'article',
+    });
+  } catch (err) {
+    logger.error({ err, crawlRunId }, 'Failed to send run failure aggregate Slack message');
+  }
 }
 
 export default webhooks;
