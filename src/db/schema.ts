@@ -8,7 +8,14 @@ import {
   timestamp,
   jsonb,
   unique,
+  index,
 } from 'drizzle-orm/pg-core';
+
+export interface PageFailure {
+  url: string;
+  statusCode: number | null;
+  reason: 'http_error' | 'no_content' | 'no_url';
+}
 
 // monitors - Source configuration (synced from config file on startup)
 export const monitors = pgTable('monitors', {
@@ -34,6 +41,8 @@ export const crawlRuns = pgTable('crawl_runs', {
   completedAt: timestamp('completed_at'),
   articlesFound: integer('articles_found').default(0).notNull(),
   newArticles: integer('new_articles').default(0).notNull(),
+  failedCount: integer('failed_count').default(0).notNull(),
+  failureSummary: jsonb('failure_summary').$type<PageFailure[]>(),
   error: text('error'),
 });
 
@@ -59,11 +68,16 @@ export const articles = pgTable(
       .notNull(),
     url: text('url').notNull(),
     title: text('title'),
+    titleNormalized: text('title_normalized'),
     firstSeenAt: timestamp('first_seen_at').defaultNow().notNull(),
     crawlRunId: integer('crawl_run_id').references(() => crawlRuns.id, { onDelete: 'set null' }),
   },
   (table) => ({
     uniqueMonitorUrl: unique().on(table.monitorId, table.url),
+    monitorTitleIdx: index('articles_monitor_title_normalized_idx').on(
+      table.monitorId,
+      table.titleNormalized
+    ),
   })
 );
 

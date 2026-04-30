@@ -1,10 +1,14 @@
-import { eq, and, lt, inArray } from 'drizzle-orm';
+import { eq, and, lt, inArray, or } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { gatewayClient } from '../services/gateway-client.js';
 import { getLLMProvider } from '../services/llm/index.js';
+import { getSlackService } from '../services/slack.js';
+import { classifyPage, normalizeTitle } from '../services/scrape-utils.js';
+import { recordRunFailure } from '../services/run-failures.js';
 import { getMonitorById } from '../monitors.config.js';
+import type { PageFailure } from '../db/schema.js';
 import type { CrawlRunResult, MonitorConfig, ProcessedArticle } from './types.js';
 
 const MAX_NOTIFICATION_RETRIES = 3;
@@ -136,6 +140,53 @@ export class MonitorRunner {
         this.requestId
       );
 
+      const effectiveListingUrl = listingResult.metadata?.sourceURL || monitor.listingUrl;
+
+      // Status-code guard on the listing itself
+      const listingFailure = classifyPage(
+        effectiveListingUrl,
+        listingResult.markdown,
+        listingResult.metadata
+      );
+      if (listingFailure) {
+        this.childLogger.warn(
+          { ...listingFailure, monitorId },
+          'Listing page failed - marking run as failed'
+        );
+        await recordRunFailure(crawlRun.id, listingFailure);
+        await db
+          .update(schema.crawlRuns)
+          .set({
+            status: 'failed',
+            completedAt: new Date(),
+            error: `Listing scrape failed: ${listingFailure.reason}${listingFailure.statusCode ? ` (status ${listingFailure.statusCode})` : ''}`,
+          })
+          .where(eq(schema.crawlRuns.id, crawlRun.id));
+        try {
+          await getSlackService().sendRunFailureNotification({
+            monitorName: monitor.name,
+            runId: crawlRun.id,
+            listingUrl: monitor.listingUrl,
+            failedCount: 1,
+            newArticles: 0,
+            failures: [listingFailure],
+            kind: 'listing',
+          });
+        } catch (err) {
+          this.childLogger.error({ err }, 'Failed to send listing-failure Slack notification');
+        }
+        return {
+          runId: crawlRun.id,
+          monitorId,
+          status: 'failed',
+          articlesFound: 0,
+          newArticles: 0,
+          error: `Listing scrape failed: ${listingFailure.reason}`,
+          startedAt: startTime,
+          completedAt: new Date(),
+        };
+      }
+
       // Store listing content
       await db.insert(schema.listingContent).values({
         crawlRunId: crawlRun.id,
@@ -149,11 +200,12 @@ export class MonitorRunner {
         return this.completeRun(crawlRun.id, 0, 0, startTime);
       }
 
-      // Extract article URLs using LLM
+      // Extract article URLs using LLM. Use post-redirect URL so relative links resolve correctly
+      // when a site has migrated (prevents hallucinating URLs against the old domain).
       const llm = getLLMProvider();
       const extractedArticles = await llm.extractArticles(
         listingResult.markdown || '',
-        monitor.listingUrl,
+        effectiveListingUrl,
         monitor.extractionPrompt
       );
 
@@ -164,11 +216,8 @@ export class MonitorRunner {
         return this.completeRun(crawlRun.id, 0, 0, startTime);
       }
 
-      // Filter out already-seen URLs
-      const newUrls = await this.filterNewUrls(
-        monitorId,
-        extractedArticles.articles.map((a) => a.url)
-      );
+      // Filter out already-seen URLs (and titles, to catch domain migrations)
+      const newUrls = await this.filterNewUrls(monitorId, extractedArticles.articles);
 
       if (newUrls.length === 0) {
         this.childLogger.info({ monitorId, articlesFound }, 'No new articles found');
@@ -244,6 +293,15 @@ export class MonitorRunner {
       this.requestId
     );
 
+    // Status-code guard: skip 4xx/5xx pages and empty content before LLM/DB work.
+    // Do NOT insert into articles table - we want the URL to be retried later.
+    const failure = classifyPage(url, scrapeResult.markdown, scrapeResult.metadata);
+    if (failure) {
+      this.childLogger.warn({ ...failure }, 'Skipping article (failed classification)');
+      await recordRunFailure(crawlRunId, failure);
+      return null;
+    }
+
     // Generate summary (outside transaction - external LLM call)
     const llm = getLLMProvider();
     const summary = await llm.summarizeArticle(
@@ -261,6 +319,7 @@ export class MonitorRunner {
           monitorId: monitor.id,
           url,
           title: title || null,
+          titleNormalized: normalizeTitle(title),
           crawlRunId,
         })
         .onConflictDoNothing()
@@ -353,19 +412,48 @@ export class MonitorRunner {
       });
   }
 
-  private async filterNewUrls(monitorId: string, urls: string[]): Promise<string[]> {
-    if (urls.length === 0) return [];
+  private async filterNewUrls(
+    monitorId: string,
+    articles: Array<{ url: string; title?: string | null }>
+  ): Promise<string[]> {
+    if (articles.length === 0) return [];
 
+    const urls = articles.map((a) => a.url);
+    const normalizedTitles = articles
+      .map((a) => normalizeTitle(a.title))
+      .filter((t): t is string => typeof t === 'string' && t.length > 0);
+
+    // One query that finds existing matches by URL OR by normalized title.
+    const matchClauses = [inArray(schema.articles.url, urls)];
+    if (normalizedTitles.length > 0) {
+      matchClauses.push(inArray(schema.articles.titleNormalized, normalizedTitles));
+    }
     const existingArticles = await db.query.articles.findMany({
-      where: and(
-        eq(schema.articles.monitorId, monitorId),
-        inArray(schema.articles.url, urls)
-      ),
-      columns: { url: true },
+      where: and(eq(schema.articles.monitorId, monitorId), or(...matchClauses)),
+      columns: { url: true, titleNormalized: true },
     });
 
     const existingUrls = new Set(existingArticles.map((a) => a.url));
-    return urls.filter((url) => !existingUrls.has(url));
+    const existingTitles = new Set(
+      existingArticles
+        .map((a) => a.titleNormalized)
+        .filter((t): t is string => typeof t === 'string' && t.length > 0)
+    );
+
+    return articles
+      .filter((a) => {
+        if (existingUrls.has(a.url)) return false;
+        const tn = normalizeTitle(a.title);
+        if (tn && existingTitles.has(tn)) {
+          this.childLogger.info(
+            { url: a.url, title: a.title },
+            'Skipping article: title already seen on different URL (likely domain migration)'
+          );
+          return false;
+        }
+        return true;
+      })
+      .map((a) => a.url);
   }
 
   private async retryFailedNotifications(monitorId: string): Promise<void> {
@@ -419,9 +507,30 @@ export class MonitorRunner {
       .where(eq(schema.crawlRuns.id, runId));
 
     this.childLogger.info(
-      { runId, articlesFound, newArticles },
+      { runId, articlesFound, newArticles, failedCount: monitorRun?.failedCount },
       'Monitor run completed'
     );
+
+    // If any article failed, send a single aggregate Slack message
+    if (monitorRun && monitorRun.failedCount > 0) {
+      const monitor = getMonitorById(monitorRun.monitorId);
+      if (monitor) {
+        const failures = (monitorRun.failureSummary || []) as PageFailure[];
+        try {
+          await getSlackService().sendRunFailureNotification({
+            monitorName: monitor.name,
+            runId,
+            listingUrl: monitor.listingUrl,
+            failedCount: monitorRun.failedCount,
+            newArticles,
+            failures,
+            kind: 'article',
+          });
+        } catch (err) {
+          this.childLogger.error({ err, runId }, 'Failed to send run failure aggregate Slack');
+        }
+      }
+    }
 
     return {
       runId,

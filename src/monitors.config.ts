@@ -52,7 +52,7 @@ If no product update articles are found, return: { "articles": [] }`,
   {
     id: 'filestage',
     name: 'Filestage Changelog',
-    listingUrl: 'https://changelog.filestage.io/',
+    listingUrl: 'https://headwayapp.co/filestage-changelog',
     schedule: '0 9 * * *',
     enabled: true,
   },

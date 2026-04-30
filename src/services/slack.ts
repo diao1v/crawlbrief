@@ -2,6 +2,7 @@ import { WebClient } from '@slack/web-api';
 import { eq, sql } from 'drizzle-orm';
 import { config } from '../config.js';
 import { db, schema } from '../db/index.js';
+import type { PageFailure } from '../db/schema.js';
 import { SlackError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 
@@ -94,6 +95,89 @@ export class SlackService {
     } catch (error) {
       logger.error({ error }, 'Failed to send Slack notification');
       throw new SlackError('Failed to send Slack message', {
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Send an aggregated per-run failure notification to Slack.
+   * Used when one or more URLs in a run failed (4xx/5xx, empty content, etc).
+   * For listing-page failures, set `kind: 'listing'` to surface a stronger alert.
+   */
+  async sendRunFailureNotification(args: {
+    monitorName: string;
+    runId: number;
+    listingUrl: string;
+    failedCount: number;
+    newArticles: number;
+    failures: PageFailure[];
+    kind: 'article' | 'listing';
+  }): Promise<string | undefined> {
+    const { monitorName, runId, listingUrl, failedCount, newArticles, failures, kind } = args;
+
+    const headerEmoji = kind === 'listing' ? ':rotating_light:' : ':warning:';
+    const headerText =
+      kind === 'listing'
+        ? `${headerEmoji} ${monitorName} listing failed`
+        : `${headerEmoji} Issue with ${monitorName} run #${runId}`;
+
+    const summaryLine =
+      kind === 'listing'
+        ? `Listing page could not be scraped. The listing URL may be broken or the site has migrated.`
+        : `*${failedCount}* URL(s) returned errors. *${newArticles}* article(s) processed successfully.`;
+
+    const visibleFailures = failures.slice(0, 10);
+    const failureLines = visibleFailures
+      .map((f) => {
+        const status = f.statusCode != null ? `status ${f.statusCode}` : f.reason;
+        const linked = f.url ? `<${f.url}|${status}>` : status;
+        return `• ${linked} — ${f.reason}`;
+      })
+      .join('\n');
+    const overflow =
+      failures.length > visibleFailures.length
+        ? `\n…and ${failures.length - visibleFailures.length} more`
+        : '';
+
+    const blocks: any[] = [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: headerText, emoji: true },
+      },
+      { type: 'divider' },
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: summaryLine },
+      },
+    ];
+
+    if (failureLines) {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: failureLines + overflow },
+      });
+    }
+
+    blocks.push({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `Listing: <${listingUrl}>` }],
+    });
+
+    try {
+      const result = await this.client.chat.postMessage({
+        channel: this.channelId,
+        blocks,
+        text: headerText,
+      });
+      logger.info(
+        { ts: result.ts, runId, monitorName, failedCount, kind },
+        'Run failure notification sent'
+      );
+      return result.ts;
+    } catch (error) {
+      logger.error({ runId, monitorName, error }, 'Failed to send run failure notification');
+      throw new SlackError('Failed to send run failure notification', {
         cause: error instanceof Error ? error.message : String(error),
       });
     }
