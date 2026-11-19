@@ -418,39 +418,208 @@ curl -X POST http://localhost:3001/run/competitor-name
 
 ## 8. VPS Deployment
 
-On the VPS, start services in this order:
+Two supported topologies. Pick one:
 
-```bash
-# 1. Firecrawl
-cd /path/to/firecrawl
-docker compose up -d
+- **Option A — Single VPS** (recommended for ≤10 monitors): all three services on one host. Simplest networking, one machine to maintain.
+- **Option B — Two VPS via Tailscale**: Firecrawl + Gateway on VPS 1, CrawlBrief on VPS 2. Useful if Firecrawl's resource usage (RAM, CPU spikes from Playwright) is competing with CrawlBrief, or for compliance/isolation reasons.
 
-# 2. Gateway
-cd /path/to/firecrawl-gateway
-docker compose up -d
+The code is identical for both — only env vars and bring-up order differ.
 
-# 3. CrawlBrief
-cd /path/to/crawlbrief
-docker compose -f docker-compose.prod.yml up -d
+### Bring-up order (same for both topologies)
+
+Always start in this order so each service is ready when the next one needs it:
+
+1. **Firecrawl** (the actual scraper + its supporting containers: redis, rabbitmq, postgres, playwright)
+2. **Firecrawl Gateway** (depends on Firecrawl being reachable)
+3. **CrawlBrief** (depends on Gateway being reachable)
+
+---
+
+### Option A — Single VPS
+
+All three stacks live on the same machine. Each container reaches the others via `host.docker.internal` (the docker bridge gateway), which routes to the host's published ports on `127.0.0.1`.
+
+**Why `host.docker.internal` and not `localhost`?** Inside a container, `localhost` means the container itself, not the host. `host.docker.internal` is a special hostname provided by Docker that resolves to the host. Each compose file already includes:
+
+```yaml
+extra_hosts:
+  - 'host.docker.internal:host-gateway'
 ```
 
-### VPS-specific .env differences
+…which makes this work on Linux (it's automatic on macOS/Windows).
+
+**Firecrawl `.env`:**
+```env
+ALLOW_LOCAL_WEBHOOKS=true
+```
+And confirm the same line appears in `x-common-env` of Firecrawl's `docker-compose.yaml`.
 
 **Gateway `.env`:**
 ```env
-# Both services on same host, no Docker networking issues
-FIRECRAWL_URL=http://localhost:3002
-FIRECRAWL_GATEWAY_BASE_URL=http://localhost:3000
+PORT=3000
+FIRECRAWL_URL=http://host.docker.internal:3002
+FIRECRAWL_GATEWAY_BASE_URL=http://host.docker.internal:3000
 ALLOW_LOCAL_WEBHOOKS=true
+
+FIRECRAWL_GATEWAY_API_TOKENS=<token>
+FIRECRAWL_GATEWAY_CLIENT_TOKENS={"crawlbrief":"<token>"}
+FIRECRAWL_GATEWAY_WEBHOOK_SECRET=<secret>
 ```
 
 **CrawlBrief `.env`:**
 ```env
-# Database URL is handled by docker-compose.prod.yml (connects via Docker network)
-# Gateway on same host
-CRAWLBRIEF_GATEWAY_URL=http://host.docker.internal:3000
+CRAWLBRIEF_PORT=3001
 CRAWLBRIEF_BASE_URL=http://host.docker.internal:3001
+CRAWLBRIEF_GATEWAY_URL=http://host.docker.internal:3000
+CRAWLBRIEF_GATEWAY_TOKEN=<same as FIRECRAWL_GATEWAY_API_TOKENS>
+CRAWLBRIEF_WEBHOOK_SECRET=<same as FIRECRAWL_GATEWAY_WEBHOOK_SECRET>
+# DB URL is set by docker-compose.prod.yml — postgres reachable via the docker network
+# ...plus Slack, LLM provider env vars
 ```
+
+**Bring up:**
+```bash
+# 1. Firecrawl (slow first build — Playwright pulls Chromium, can take 5–15 min)
+cd /server/projects/firecrawl
+sudo docker compose up -d --build
+sudo docker compose ps                    # wait for healthy
+
+# 2. Gateway
+cd /server/projects/firecrawl-gateway
+sudo docker compose up -d --build
+curl http://localhost:3000/health         # expect {"status":"ok"}
+
+# 3. CrawlBrief (apply migrations on first run)
+cd /server/projects/crawlbrief
+sudo docker compose -f docker-compose.prod.yml up -d
+sudo docker compose -f docker-compose.prod.yml exec crawlbrief node dist/db/migrate.js
+```
+
+**Smoke test:**
+```bash
+curl -X POST -H "Authorization: Bearer $CRAWLBRIEF_API_TOKEN" \
+  http://localhost:3001/run/<monitor-id>
+sudo docker logs -f crawlbrief --tail=50
+```
+
+Expected log chain: monitor run started → batch scrape submitted → `webhooks/firecrawl` `type:page` received → LLM extraction → `Crawl run completed`.
+
+---
+
+### Option B — Two VPS via Tailscale
+
+VPS 1 runs Firecrawl + Gateway. VPS 2 runs CrawlBrief. The two communicate over Tailscale's private network, which gives each VPS a stable internal IP (100.x.x.x) regardless of public IP changes.
+
+**Why Tailscale?** Avoids exposing the Gateway publicly. The Gateway has its own auth, but keeping the listening port off the public internet removes a class of attack surface. Tailscale also handles dynamic IPs — useful when one of your VPS doesn't have a fixed public address.
+
+**Setup Tailscale:**
+```bash
+# On both VPS
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+sudo tailscale ip -4    # note each VPS's 100.x.x.x address
+```
+
+For the rest of this section, assume:
+- VPS 1 (Firecrawl + Gateway) Tailscale IP: `100.125.237.65`
+- VPS 2 (CrawlBrief) Tailscale IP: `100.84.191.119`
+
+#### VPS 1 — Firecrawl + Gateway
+
+**Firecrawl `.env`:** same as Option A (`ALLOW_LOCAL_WEBHOOKS=true`, plus the `x-common-env` line in compose).
+
+**Gateway `.env`:**
+```env
+PORT=3000
+FIRECRAWL_URL=http://host.docker.internal:3002
+# Tell Firecrawl to send webhooks back to gateway via Tailscale
+FIRECRAWL_GATEWAY_BASE_URL=http://100.125.237.65:3000
+ALLOW_LOCAL_WEBHOOKS=true
+
+FIRECRAWL_GATEWAY_API_TOKENS=<token>
+FIRECRAWL_GATEWAY_CLIENT_TOKENS={"crawlbrief":"<token>"}
+FIRECRAWL_GATEWAY_WEBHOOK_SECRET=<secret>
+```
+
+**Gateway `docker-compose.yml` — bind to Tailscale IP only** (don't expose publicly):
+```yaml
+ports:
+  - '100.125.237.65:3000:3000'
+```
+
+**Bring up VPS 1:**
+```bash
+cd /server/projects/firecrawl && sudo docker compose up -d --build
+cd /server/projects/firecrawl-gateway && sudo docker compose up -d --build
+# From VPS 2, verify reachability:
+# curl http://100.125.237.65:3000/health
+```
+
+#### VPS 2 — CrawlBrief
+
+**CrawlBrief `.env`:**
+```env
+CRAWLBRIEF_PORT=3001
+# CrawlBrief's webhook URL — gateway forwards results here over Tailscale
+CRAWLBRIEF_BASE_URL=http://100.84.191.119:3001
+# Gateway lives on VPS 1
+CRAWLBRIEF_GATEWAY_URL=http://100.125.237.65:3000
+CRAWLBRIEF_GATEWAY_TOKEN=<same as FIRECRAWL_GATEWAY_API_TOKENS>
+CRAWLBRIEF_WEBHOOK_SECRET=<same as FIRECRAWL_GATEWAY_WEBHOOK_SECRET>
+# ...plus DB, Slack, LLM provider env vars
+```
+
+**CrawlBrief `docker-compose.prod.yml` — bind to Tailscale IP** so the gateway can reach it:
+```yaml
+ports:
+  - '100.84.191.119:3001:3001'
+```
+
+**Bring up VPS 2:**
+```bash
+cd /server/projects/crawlbrief
+sudo docker compose -f docker-compose.prod.yml up -d
+sudo docker compose -f docker-compose.prod.yml exec crawlbrief node dist/db/migrate.js
+```
+
+**Smoke test (from VPS 2):**
+```bash
+curl -X POST -H "Authorization: Bearer $CRAWLBRIEF_API_TOKEN" \
+  http://localhost:3001/run/<monitor-id>
+sudo docker logs -f crawlbrief --tail=50
+```
+
+---
+
+### Switching between topologies later
+
+The data model and code are identical, so migration is mostly env vars + Docker bring-up:
+
+**Two-VPS → Single-VPS** (consolidate to one box):
+1. Copy Firecrawl + Gateway projects to the CrawlBrief VPS (via `git clone` or `rsync`).
+2. Copy `.env` files manually (don't commit secrets).
+3. Update both Gateway and CrawlBrief env vars: replace Tailscale IPs with `host.docker.internal` (see Option A above).
+4. `docker compose down` on the old VPS 1.
+5. Bring up Firecrawl → Gateway → CrawlBrief on the merged host.
+6. Optional: remove Tailscale if no other use (`sudo tailscale down && sudo apt remove tailscale`).
+
+**Single-VPS → Two-VPS** (split out CrawlBrief or Firecrawl):
+1. Provision the second VPS, install Tailscale on both, note the 100.x IPs.
+2. Move the relevant project directory to the second VPS.
+3. Pre-flight: dump+restore the postgres data if CrawlBrief moves (`pg_dump` → `scp` → `psql`).
+4. Update env vars: replace `host.docker.internal` with the appropriate Tailscale IP (see Option B above).
+5. Bring up services on each VPS in the standard order.
+
+### Choosing between topologies
+
+| Concern | Single-VPS | Two-VPS via Tailscale |
+|---|---|---|
+| Cost | One server | Two servers |
+| Networking complexity | Lowest (`host.docker.internal`) | Tailscale config + IP-bound ports |
+| Resource isolation | Firecrawl can starve CrawlBrief on small VPS | Independent resource limits |
+| Failure blast radius | All services down together | One VPS down ≠ total outage |
+| Backups | One DB to back up | One DB on VPS 2 |
+| Recommended when | ≤10 monitors, small VPS is fine | Firecrawl is RAM/CPU heavy or you want isolation |
 
 ---
 
@@ -460,7 +629,64 @@ CRAWLBRIEF_BASE_URL=http://host.docker.internal:3001
 |---------|-------|-----|
 | Gateway can't reach Firecrawl | Docker networking | Use `host.docker.internal:3002` when gateway is in Docker |
 | Firecrawl webhook fails | SSRF protection | Set `ALLOW_LOCAL_WEBHOOKS=true` in Firecrawl's `.env` and `x-common-env` in its docker-compose |
+| Gateway rejects webhook URL with private IP | Gateway URL validator | Set `ALLOW_LOCAL_WEBHOOKS=true` in **gateway's** `.env` (separate from Firecrawl's) |
 | Webhook signature invalid | Secret mismatch | Ensure `FIRECRAWL_GATEWAY_WEBHOOK_SECRET` = `CRAWLBRIEF_WEBHOOK_SECRET` |
 | LLM returns truncated JSON | Output too large | Increase `max_tokens` or trim input markdown |
 | Slack notifications not sending | Pending in DB | Check `notifications` table; processor runs every minute |
 | `z.coerce.boolean()` ignores "false" | Zod string coercion | Use `.transform((val) => val === 'true')` instead |
+| Slack flooded with garbage 404 summaries | Site changed URL pattern but listing still emits stale links | Status-code guard now skips 4xx/5xx pages before LLM. Check `crawl_runs.failed_count` and `failure_summary` to see what was skipped. See "Site domain migration" example below. |
+| Aggregate `:warning: Issue with X run #N` Slack message every day | Listing emits URLs that consistently 404 | Either (a) update `monitor.listingUrl` in `monitors.config.ts`, or (b) flip `enabled: false` for that monitor until investigated. Each daily run records one aggregate message; it stops once the underlying URLs return 200 |
+| Re-notification spam after a domain migration | Old DB rows have old-domain URLs; new listing emits new-domain URLs → URL dedup misses everything | Two protections: (1) the title-based dedup catches articles whose `title_normalized` matches an existing row, even on a different URL; (2) for one-time domain moves, run a SQL `UPDATE` to rewrite the host (see example below) |
+| `:rotating_light: <monitor> listing failed` Slack message | The listing page itself returned 4xx/5xx | Open the listing URL in a browser. If the site moved, update `monitor.listingUrl`; if it's transiently down, ignore — next run retries |
+| Title-based dedup not catching migrated articles | `title_normalized` is NULL for older rows (pre-migration backfill) | Run the backfill: `UPDATE articles SET title_normalized = lower(trim(regexp_replace(title, '\s+', ' ', 'g'))) WHERE title IS NOT NULL AND title_normalized IS NULL;` |
+
+### Worked example: Site domain migration (the "Filestage" pattern)
+
+This is the canonical failure mode the status-code guard + title dedup were built for. Symptoms and fix:
+
+**Symptom:** ~10 Slack messages titled like "404 Error — Page Not Found" with garbage summaries describing a 404 page.
+
+**Root cause:** The competitor migrated their changelog (e.g. `https://changelog.example.com/` 301-redirected to `https://headwayapp.co/example-changelog`). Firecrawl follows redirects and scrapes the new domain, but the LLM was given the *old* listing URL as the base for resolving relative links — so it produced URLs on the old domain with the new path prefix, all of which 404.
+
+**What the fix does (already in code):**
+1. Listing scrapes use `metadata.sourceURL` (post-redirect URL) as the base for LLM extraction. Future migrations don't produce phantom URLs.
+2. Status-code guard skips any 4xx/5xx page before LLM/Slack work.
+3. Title-based dedup catches articles whose URL changed but title didn't.
+
+**Manual recovery for an already-affected monitor:**
+
+```sql
+-- 1. Inspect what's in the DB
+SELECT count(*), substring(url from 'https?://[^/]+') AS host
+FROM articles WHERE monitor_id = '<monitor-id>' GROUP BY host;
+
+-- 2. Update monitors.config.ts with the new listingUrl, redeploy.
+
+-- 3. Inside a transaction, delete garbage rows and rewrite host on real ones
+BEGIN;
+DELETE FROM articles
+ WHERE monitor_id = '<monitor-id>'
+   AND url LIKE '<old-host>/<bad-path-prefix>/%';   -- the 404 garbage rows
+
+UPDATE articles
+   SET url = REPLACE(url, '<old-host>/', '<new-host>/')
+ WHERE monitor_id = '<monitor-id>'
+   AND url LIKE '<old-host>/%';
+
+-- 4. Verify everything's on the new host
+SELECT count(*), substring(url from 'https?://[^/]+') AS host
+FROM articles WHERE monitor_id = '<monitor-id>' GROUP BY host;
+
+-- 5. If looks good:
+COMMIT;
+```
+
+**Verify with a manual run** (no Slack messages should fire if dedup works):
+
+```bash
+curl -X POST -H "Authorization: Bearer $CRAWLBRIEF_API_TOKEN" \
+  http://localhost:3001/run/<monitor-id>
+sudo docker logs -f crawlbrief --tail=100
+# Expected: "Articles extracted successfully" → "No new articles found" → "Crawl run completed"
+# No "Sending Slack notification" lines, no failure aggregate.
+```
